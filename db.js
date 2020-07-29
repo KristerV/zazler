@@ -2,7 +2,7 @@ const url = require('url');
 const fs = require('fs');
 const Lite = require('sqlite'); //sqlite is wrapper for sqlite3
 const Lite3 = require('sqlite3');
-const { breakOn, zipObject, uriArgs, parseBool, isPending } = require('./toolbox.js');
+const { breakOn, zipObject, uriArgs, parseBool } = require('./toolbox.js');
 
 trace = x => { console.log(x); return x; }
 
@@ -40,7 +40,7 @@ function urlToConnection(dbUrl) {
     return Object.assign({},
       sslFiles(mapInt(flatToTree(uriArgs(u.query)))),
       { type: 'pg'
-      , port: parseInt(u.port || 5432) 
+      , port: parseInt(u.port || 5432)
       , host: u.hostname
       , database: u.pathname ? u.pathname.split('/')[1] : ''
       },
@@ -50,7 +50,7 @@ function urlToConnection(dbUrl) {
     return Object.assign({},
       sslFiles(mapInt(flatToTree(uriArgs(u.query)))),
       { type: 'my'
-      , port: parseInt(u.port || 3306) 
+      , port: parseInt(u.port || 3306)
       , host: u.hostname
       , database: u.pathname ? u.pathname.split('/')[1] : ''
       },
@@ -63,7 +63,7 @@ function urlToConnection(dbUrl) {
     let c = Object.assign({},
     mapInt(flatToTree(uriArgs(u.query))),
     { type: 'db2'
-    , port: parseInt(u.port || 6000) 
+    , port: parseInt(u.port || 6000)
     , host: u.hostname
     , database: u.pathname ? u.pathname.split('/')[1] : ''
     },
@@ -77,7 +77,7 @@ function urlToConnection(dbUrl) {
     let c = Object.assign({},
       mapInt(flatToTree(uriArgs(u.query))),
       { type: 'or'
-      , port: parseInt(u.port || 1521) 
+      , port: parseInt(u.port || 1521)
       , host: u.hostname
       , database: u.pathname ? u.pathname.split('/')[1] : ''
       },
@@ -129,44 +129,18 @@ async function DbConnPg(props) {
   pg.types.setTypeParser(701, parseFloat);
   pg.types.setTypeParser(700, parseFloat);
 
-  const adm = { value: new pg.Pool(Object.assign({}, props, { max: 1 })) };
-  return Object.create(DbConnPg.Proto, { pg: { value: pg }, props: { value: props }, pool: { value: new pg.Pool(props) }, _schema: { value: null, enumerable: true, writable: true }, _admin: adm });
+  return Object.create(DbConnPg.Proto, { pg: { value: pg }, props: { value: props }, pool: { value: new pg.Pool(props) }, _schema: { value: null, enumerable: true, writable: true } });
 }
 DbConnPg.Proto = {
   // end:   async function () { return null; /* await this.pool.end() */ },
-  query: async function (q, args = [], cancelCall) {
-    if (cancelCall && !isPending(cancelCall)) { // just to save some resource if there is canceled query
-      throw { cancelCall: true };
-    }
-
+  query: async function (q, args = []) {
     const client = await this.pool.connect();
-    const cancelFn = async () => {
-      await this._admin.query("SELECT pg_cancel_backend(" + client.processID + ")");
-
-      // I really don't know why but without special query the previous query doesn't disappear. So, easiest possible query.
-      await client.query("SELECT 1");
-    }
-    try {
-      return this.runQ(q, args, client, cancelCall, cancelFn);
-    }
-    catch (e) { throw e; }
-    finally   { client.release(); }
+    let res = this.runQ(q, args, client);
+    client.release();
+    return res;
   },
-  runQ: async function (q, args = [], client, cancelCall, cancelQueryFn) {
-    // const R = await client.query(q, args);
-    let R;
-    try {
-      R = await Promise.race([client.query(q, args), cancelCall]);
-    }
-    catch (e) {
-      if ((e || {}).cancelCall) {
-        // client.cancel();
-        await cancelQueryFn();
-        throw e;
-      }
-      throw e;
-    }
-
+  runQ: async function (q, args = [], client) {
+    const R = await client.query(q, args);
     let r = R.rows;
     let o = R.fields.map(f => f.name);
     let t = R.fields.map(f => {
@@ -178,39 +152,22 @@ DbConnPg.Proto = {
     })
     return { data: r, cols: o, types: t.map(([_,t]) => t), rawTypes: t.map(([t]) => t) };
   },
-  transaction: async function (cancelCall) {
-    if (cancelCall && !isPending(cancelCall)) { // just to save some resource if there is canceled query
-      throw { cancelCall: true };
-    }
-    
+  transaction: async function () {
     const client = await this.pool.connect();
     let q = this.query.bind(this);
     await client.query('BEGIN');
-    const cancelFn = async () => {
-      await this._admin.query("SELECT pg_cancel_backend(" + client.processID + ")");
-
-      // I really don't know why but without special query the previous query doesn't disappear. So, easiest possible query.
-      try { await client.query("ROLLBACK"); } catch (_) {}
-      try { await client.query("SELECT 1"); } catch (_) {}
-    }
-
     return {
-      commit: async () => { await client.query('COMMIT'); client.release(); },
-      query:  (sql,args = []) => this.runQ(sql, args, client, cancelCall, cancelFn), // FIXME
+      commit  : async () => { await client.query('COMMIT'  ); client.release(); },
+      rollback: async () => { await client.query('ROLLBACK'); try { client.release(); } catch (_) {} },
+      query:  (sql,args = []) => this.runQ(sql, args, client),
       exec:   async (sql, args = []) => {
         try {
-          let { rowCount } = await Promise.race( [ client.query(sql, args), cancelCall ] );
+          let { rowCount } = await client.query(sql, args);
           return rowCount;
         } catch (SQLE) {
-          if ( (SQLE||{}).cancelCall ) {
-            await cancelFn();
-            client.release();
-            throw SQLE;
-          } else {
-            await client.query('ROLLBACK');
-            client.release();
-            throw SQLE;
-          }
+          await client.query('ROLLBACK');
+          client.release();
+          throw SQLE;
         }
       }
     }
@@ -225,7 +182,7 @@ DbConnPg.Proto = {
     }
   },
 */
-  schema: async function () { 
+  schema: async function () {
     if (!this._schema) await this.learn();
     return Promise.resolve(this._schema);
   },
@@ -237,7 +194,6 @@ DbConnPg.Proto = {
       , this.query(DbConnPg.queryFields)
       , this.query(DbConnPg.queryConstraints)]);
 */
-
     let client = await this.pool.connect();
     const [tables, fields] = await Promise.all([ client.query(DbConnPg.queryTables) , client.query(DbConnPg.queryFields) ]);
     // let constr = this.query(DbConnPg.queryConstraints)]);
@@ -248,7 +204,7 @@ DbConnPg.Proto = {
     let b = { read: false, write: false, hidden: true, prot: false };
     this._schema =
       tables.rows.map( t => Object.assign({}, b, { _: 'table', name: t.name, comment: t.comment })).concat (
-      fields.rows.map( f => Object.assign({}, b, { _: 'field', name: f.attname, table: f.relname, comment: f.comment, autonum: false, type: f.type, genType: tmap.get(f.type) || 'str' })))
+      fields.rows.map( f => Object.assign({}, b, { _: 'field', name: f.attname, table: f.relname, comment: f.comment, autonum: false, type: f.type, genType: tmap.get(f.type) || 'str', notnull: f.attnotnull })))
     // constr.rows.map( r => { _: '
     client.release();
   }
@@ -326,7 +282,7 @@ DbConnPg.types = {
   , 1270 : [ parseStringArray); // timetz[]
 */
 }
-DbConnPg.queryTables = 
+DbConnPg.queryTables =
   " SELECT c.relname AS name, COALESCE(pg_catalog.obj_description(c.oid, 'pg_class'), '') AS comment" +
   " FROM pg_catalog.pg_class c" +
   "   LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace" +
@@ -336,7 +292,7 @@ DbConnPg.queryTables =
   "   AND n.nspname !~ '^pg_toast'" +
   "   AND pg_catalog.pg_table_is_visible(c.oid)" +
   " ORDER BY c.relname";
-DbConnPg.queryFields = 
+DbConnPg.queryFields =
   " SELECT c.relname, a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) AS type, coalesce(pg_catalog.col_description(a.attrelid, a.attnum),'') AS comment, a.attnotnull" +
   " FROM pg_catalog.pg_attribute a" +
   "   JOIN ( " +
@@ -378,7 +334,8 @@ DbConnMy.Proto = {
       client.query('BEGIN', err => {
         if (err) { throw_(err); return; }
         return_({
-          commit: () => { client.query('COMMIT', () => client.release() ) }
+          commit  : () => { client.query('COMMIT'  , () => client.release() ) }
+        , rollback: () => { client.query('ROLLBACK', () => { try { client.release(); } catch (_) {} } ) }
         , query: (sql, args = []) => {
             return new Promise(ok => client.query(sql, args, (err,res,fld) => ok({ data: res, cols: fld.map(f => f.Field), types: fields.map(f => f.Type), rawTypes: fields.map(f => f.Type) })));
         }
@@ -396,7 +353,7 @@ DbConnMy.Proto = {
     })
   })
   },
-  schema: async function () { 
+  schema: async function () {
     if (!this._schema) await this.learn();
     return Promise.resolve(this._schema);
   },
@@ -408,7 +365,7 @@ DbConnMy.Proto = {
     for (let i = 0; i < tables.length; i++) {
       let [cols] = await Q('SHOW FULL COLUMNS FROM ' + tables[i]);
       R.push({_: 'table', name: tables[i], comment: null }) // TODO: comment
-      cols.forEach(c => 
+      cols.forEach(c =>
         R.push({_: 'field', name: c.Field, table: tables[i], comment: c.Comment, autonum: c.Extra.indexOf('auto_increment') > -1, type: c.Type, genType: 'str'}) // FIXME genType
       )
     }
@@ -445,11 +402,11 @@ DbConnMy.types = {
 , [0xfc]: [ 'blob'      , 'str']       // MYSQL_TYPE_BLOB           0xfc   Implemented by ProtocolBinary::MYSQL_TYPE_BLOB
 , [0xfd]: [ 'var_string', 'str']       // MYSQL_TYPE_VAR_STRING     0xfd   Implemented by ProtocolBinary::MYSQL_TYPE_VAR_STRING
 , [0xfe]: [ 'string'    , 'str']       // MYSQL_TYPE_STRING         0xfe   Implemented by ProtocolBinary::MYSQL_TYPE_STRING
-, [0xff]: [ 'geometry'  , 'str']       // MYSQL_TYPE_GEOMETRY       0xff   
+, [0xff]: [ 'geometry'  , 'str']       // MYSQL_TYPE_GEOMETRY       0xff
 }
 
 async function DbConnLt(props) {
-  let conn = await Lite.open(props.filename || ':memory:', { mode: Lite3.OPEN_READWRITE });
+  let conn = await Lite.open({ filename: props.filename || ':memory:', mode: Lite3.OPEN_READWRITE, driver: Lite3.Database });
   let pragma, P = DbConnLt.Pragmas;
   for (pragma in P)
     if (props[pragma])
@@ -465,11 +422,11 @@ DbConnLt.Proto = {
       let types = new Array(cols.length);
       let unknown = cols.length;
       let tmap = { number: 'double', "boolean": 'bool' }
-      
+
       // find types
-      for (let r = 0; r < R.length && unknown > 0; r ++) 
+      for (let r = 0; r < R.length && unknown > 0; r ++)
         for (let c = 0; c < cols.length; c++)
-          if (!types[c]) 
+          if (!types[c])
             if (R[r][c] !== null) types[c] = typeof R[r][cols[c]];
 
 
@@ -488,6 +445,7 @@ DbConnLt.Proto = {
         let {changes, lastID} = await client.run(sql, args);
         return changes;
       }
+    , rollback: async ()  => { }
     , commit: async ()  => {
         // await client.run('COMMIT');
         // await client.close();
@@ -499,10 +457,11 @@ DbConnLt.Proto = {
     return this._schema;
   },
   learn: async function () {
+    // FIXME: notnull is missing
     const client = this.conn;
     let tables = await client.all(DbConnLt.queryTables);
     let fields = [];
-    let base = { read: false, write: false, hidden: false, prot: false };
+    let base = { read: false, write: false, hidden: false, prot: false, notnull: false };
     for (let t = 0; t < tables.length; t++) {
       let f = await client.all(DbConnLt.queryFields(tables[t].name))
       fields = fields.concat(f.map( f => Object.assign({_: 'field', name: f.name, table: tables[t].name }, base)));
@@ -541,7 +500,7 @@ DbConnLt.Pragmas = {
 ,  read_uncommitted:    x => parseBool(x)?'1':'0'
 ,  recursive_triggers:  x => parseBool(x)?'1':'0'
 ,  reverse_unordered_selects: x => parseBool(x)?'1':'0'
-// ,  schema_version:      
+// ,  schema_version:
 ,  secure_delete:       x => (typeof x === 'string' && x.toLowerCase() === 'fast') ? 'FAST' : (parseBool(x)?'1':'0')
 ,  soft_heap_limit:     parseInt
 ,  synchronous:         parseInt // TODO, shoud be more sophisticated
@@ -549,7 +508,7 @@ DbConnLt.Pragmas = {
 ,  threads:             parseInt
 ,  user_version:        parseInt
 ,  wal_autocheckpoint:  parseInt
-// ,  wal_checkpoint:     
+// ,  wal_checkpoint:
 ,  writable_schema:     x => parseBool(x)?'1':'0'
 };
 
@@ -588,7 +547,8 @@ DbConnOr.Proto = {
     return {
       query: (sql, args = []) => client.execute(sql, args)
     , exec:   async (sql, args = []) => (await client.execute(sql, args)).rowsAffected // TODO error handling and rollback
-    , commit: async () => { await client.execute('COMMIT'); client.release(); }
+    , commit:   async () => { await client.execute('COMMIT');   client.release(); }
+    , rollback: async () => { await client.execute('ROLLBACK'); try { client.release(); } catch (_) {} }
     }
   },
   schema: async function () {
@@ -610,7 +570,7 @@ DbConnOr.Proto = {
 DbConnOr.queryFields = "SELECT table_name, column_name, data_type, data_length FROM USER_TAB_COLUMNS";
 
 // Based on true story: https://github.com/oracle/node-oracledb/blob/master/doc/api.md#oracledbconstantsdbtype
-DbConnOr.types = 
+DbConnOr.types =
 {  101 : [ 'BINARY_DOUBLE', 'int' ]
 ,  100 : [ 'BINARY_FLOAT', 'double']
 ,  113 : [ 'BLOB', 'str' ]
@@ -685,7 +645,8 @@ DbConnDb2.Proto = {
               })
             })
         )
-        , commit: async () => (new Promise((ok, failure) => db.query('COMMIT', [], (err, R) => (err ? failure(err) : ok())) ))
+        , rollback: async () => (new Promise((ok, failure) => db.query('COMMIT'  , [], (err, R) => (err ? failure(err) : ok())) ))
+        , commit:   async () => (new Promise((ok, failure) => db.query('ROLLBACK', [], (err, R) => (err ? failure(err) : ok())) ))
         })
       });
     }) });
@@ -707,7 +668,7 @@ DbConnDb2.Proto = {
               if (err) { failure(err); return; }
 
               sch.push(Object.assign({_: 'table', comment: '', name:  tname }, base));
-    
+
               cols.forEach(({NAME, COLTYPE}) => {
                 sch.push(Object.assign({_: 'field', comment: '', table: tname, name: NAME, type: COLTYPE.trim(), genType: (DbConnDb2.types[ COLTYPE.trim() ]||['?','?'])[1], autonum: false }, base))
               });
@@ -721,8 +682,8 @@ DbConnDb2.Proto = {
 };
 DbConnDb2.queryTables = "select tabname from syscat.tables";
 DbConnDb2.queryFields = "select name, coltype from Sysibm.syscolumns where tbname = ?";
-  
-DbConnDb2.types = 
+
+DbConnDb2.types =
 {  "SMALLINT": [ "SMALLINT", "int" ]
 ,  "INTEGER": [ "INTEGER", "int" ]
 ,  "BIGINT": [ "BIGINT", "int" ]

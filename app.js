@@ -144,6 +144,7 @@ AppPrototype = {
       if      (A.location) { this.auth.type = 'location'; this.auth.location = A.location; }
       else if (A.content)  { this.auth.type = 'content';  this.auth.content  = A.content; this.auth.contentVars = conf.auth['content-vars'] || {} }
       else if (A.realm  )  { this.auth.type = 'basic';    this.auth.realm = A.realm; }
+      else if (A.text   )  { this.auth.type = 'text';     this.auth.text  = A.text; }
       else throw new Exception(102, new Error(), { auth: conf.auth });
       if (!this.auth.Q.select) throw new Exception(103, new Error(), { auth: conf.auth });
     }
@@ -171,13 +172,15 @@ AppPrototype = {
 
   meta: function (t, f = null) { return f ? (this.metaF[t]||{})[f] || null : this.metaT[t] || null; },
 
-  query: async function(tableAs, vars, user, pass, cancelCall) {
+  query: async function(tableAs, vars, user, pass) {
 
+    const dbh = this.conn;
     let [tq, fmt] = breakOn(tableAs, '.');
     let [table, as] = breakOn(tq, '@');
     let R = { table, as, format: null, user: null, pass: null, req: { user: null, pass: null, pipe: null, format: null, isMain: true, url: null, isPost: false }, vars: vars, meta: {}, cookie: {} };
     let me = this;
 
+    let authTried = false;
     let _auth = null;
     R.meta = {
       cookie: async () => ({})
@@ -186,20 +189,32 @@ AppPrototype = {
         if (!_auth) {
             if (!me.auth) throw new Exception(104, new Error());
             let unprotectedSchema = (await this.schema()).map(f => Object.assign({}, f, {prot: false}));
-            _auth = (await me.runSelect(me.auth.Q.from.table, null, me.auth.Q,
+            _auth = (await me.runSelect(dbh, me.auth.Q.from.table, null, me.auth.Q,
                   Object.assign({}, R.meta, { auth: async () => { throw new Exception(105, new Error(), { auth: conf.auth })  } }),
-                  unprotectedSchema, [], R, cancelCall
+                  unprotectedSchema, [], R
                 )).data[0] || null;
+            authTried = true;
         }
         if (!_auth) throw new NeedAuth();
         return _auth;
       }
+    , authN:  async () => {
+        if (!_auth && !authTried) {
+            if (!me.auth) throw new Exception(104, new Error());
+            let unprotectedSchema = (await this.schema()).map(f => Object.assign({}, f, {prot: false}));
+            _auth = (await me.runSelect(dbh, me.auth.Q.from.table, null, me.auth.Q,
+                  Object.assign({}, R.meta, { auth: async () => { throw new Exception(105, new Error(), { auth: conf.auth })  } }),
+                  unprotectedSchema, [], R
+                )).data[0] || null;
+            authTried = true;
+        }
+        return _auth || {};
+      }
     }
-    
+
     let sqlResult;
-    try { sqlResult = await this.runSelect(R.table, R.as, R.vars, R.meta, await this.schema(), this.filt, R.req, cancelCall); }
+    try { sqlResult = await this.runSelect(dbh, R.table, R.as, R.vars, R.meta, await this.schema(), this.filt, R.req); }
     catch (someErr) {
-      if ((someErr || {}).cancelCall) throw someErr;
       if (someErr instanceof NeedAuth) { throw "Unauthorized"; }
       else { this.evError(someErr); throw someErr; }
     }
@@ -213,13 +228,14 @@ AppPrototype = {
     }
   },
 
-  post: async function (tableAs, postVars, getVars, postInput, user, pass, cancelCall) {
+  post: async function (dbh, tableAs, postVars, getVars, postInput, user, pass) {
 
     let [tq, fmt] = breakOn(tableAs, '.');
     let [table, as] = breakOn(tq, '@');
     let R = { table, as, format: null, user: null, pass: null, req: { user: null, pass: null, pipe: null, format: null, isMain: true, url: null, isPost: false }, vars: getVars, meta: {}, cookie: {} };
     let me = this;
 
+    let authTried = false;
     let _auth = null;
     R.meta = {
       cookie: async () => ({})
@@ -228,7 +244,7 @@ AppPrototype = {
         if (!_auth) {
             if (!me.auth) throw new Exception(104, new Error());
             let unprotectedSchema = (await this.schema()).map(f => Object.assign({}, f, {prot: false}));
-            _auth = (await me.runSelect(me.auth.Q.from.table, null, me.auth.Q,
+            _auth = (await me.runSelect(dbh, me.auth.Q.from.table, null, me.auth.Q,
                   Object.assign({}, R.meta, { auth: async () => { throw new Exception(105, new Error(), { auth: conf.auth })  } }),
                   unprotectedSchema, [], R
                 )).data[0] || null;
@@ -236,12 +252,23 @@ AppPrototype = {
         if (!_auth) throw new NeedAuth();
         return _auth;
       }
+    , authN:  async () => {
+        if (!_auth && !authTried) {
+            if (!me.auth) throw new Exception(104, new Error());
+            let unprotectedSchema = (await this.schema()).map(f => Object.assign({}, f, {prot: false}));
+            _auth = (await me.runSelect(dbh, me.auth.Q.from.table, null, me.auth.Q,
+                  Object.assign({}, R.meta, { auth: async () => { throw new Exception(105, new Error(), { auth: conf.auth })  } }),
+                  unprotectedSchema, [], R
+                )).data[0] || null;
+            authTried = true;
+        }
+        return _auth || {};
+      }
     }
     
     let sqlResult;
-    try { sqlResult = await this.runPost(R.table, R.vars, R.req, R.meta, await this.schema(), postInput, R, {}, cancelCall); }
+    try { sqlResult = await this.runPost(dbh, R.table, R.vars, R.req, R.meta, await this.schema(), postInput, R); }
     catch (someErr) {
-      if ((someErr || {}).cancelCall) throw someErr;
       if (someErr instanceof NeedAuth) { throw "Unauthorized"; }
       else { this.evError(someErr); throw someErr; }
     }
@@ -258,9 +285,7 @@ AppPrototype = {
   // returns { headers: [ {key: val }], text: return content, code: 200 }
   // code can be "unauthorized" (401)
   // if error/exception emerges it is thrown
-  request: async function (tableFormat, vars, extra = {}, cookies = {}, post = null, files = null, user = null, pass = null, cancelCall) {
-    
-    // if (!cancelCall) cancelCall = Promise.race([]);
+  request: async function (tableFormat, vars, extra = {}, cookies = {}, post = null, files = null, user = null, pass = null) {
     
     await this.block; // wait till schema is learned at the beginning
 
@@ -272,11 +297,11 @@ AppPrototype = {
     [table, format] = breakOn(tableFormat || this.index, '.');
     [table, as] = breakOn(table, '@');
 
-    if (!format) throw new Exception(300, new Error(), { template: template, templateDirs: this.tmplDirs });
+    if (!format) throw new Exception(300, new Error(), { template: format, table: table, templateDirs: this.tmplDirs });
     // if ( !['_empty', '_schema', '_meta', '_single'].includes(table) && !sch.find(e => e._ === 'table' && e.name === table))
     //  throw new Exception(302, new Error(), { table: table }); // TODO: look for joins and alias
 
-    let R = { table, as, format, user, pass, opts: {}, vars, meta: {}, cookie: {}, req: { ...extra, table, format, user, pass, pipe: null, isMain: true, isPost: !!post }, files: {} };
+    let R = { table, as, format, user, pass, opts: {}, vars, meta: {}, cookie: {}, req: { ...extra, table, format, user, pass, pipe: null, isMain: true, isPost: !!post }, files };
 
     R.opts = Object.assign({}, Opts.def, vars.opts ? Opts.parse(vars.opts) : {});
 
@@ -294,6 +319,31 @@ AppPrototype = {
     R.vars = R.req.vars = vars;
 
     let _auth = null, _cookie = null, _req = null;
+
+    /*
+      When it is post request then everything will run in one transaction and inner transactions are not runned
+      When it is get request then transaction can be queried.
+    */
+    let fakeLayer = d => {
+      let realRollback = d.rollback;
+      let ok = true;
+      let realCommit = d.commit.bind(d);
+      let h = Object.assign(d, {
+        transaction: () => Promise.resolve(d)
+      , commit: () => null
+      , finalCommit: () => { if (ok) { return realCommit(); } }
+      });
+      h.rollback = async () => {
+        ok = false;
+        realRollback.apply(d);
+        h.rollback = h.transaction = h.commit = h.query = h.exec = () => { };
+        return null;
+      }
+      return h;
+    }
+    const dbh = R.req.isPost ? fakeLayer(await this.conn.transaction()) : this.conn;
+
+    let authTried = false;
     R.meta = {
       cookie: async () => { if (!_cookie) _cookie = Object.map(cookies||{}, jsToQVal); return _cookie; }
     , req:    async () => R.req // Object.map(R.req, jsToQVal)
@@ -301,10 +351,23 @@ AppPrototype = {
         if (!_auth) {
             if (!me.auth) throw new Exception(104, new Error());
             let unprotectedSchema = (await this.schema()).map(f => Object.assign({}, f, {prot: false}));
-            _auth = (await me.runSelect(me.auth.Q.from.table, null, me.auth.Q, Object.assign({}, R.meta, { auth: async () => ({}) }), unprotectedSchema, [], {}, cancelCall)).data[0] || null;
+            _auth = (await me.runSelect(dbh, me.auth.Q.from.table, null, me.auth.Q, Object.assign({}, R.meta, { auth: async () => ({}) }), unprotectedSchema, [], {})).data[0] || null;
         }
+        authTried = true;
         if (!_auth) throw new NeedAuth();
         return _auth;
+      }
+    , authN:  async () => {
+        if (!_auth && !authTried) {
+            if (!me.auth) throw new Exception(104, new Error());
+            let unprotectedSchema = (await this.schema()).map(f => Object.assign({}, f, {prot: false}));
+            _auth = (await me.runSelect(dbh, me.auth.Q.from.table, null, me.auth.Q,
+                  Object.assign({}, R.meta, { auth: async () => { throw new Exception(105, new Error(), { auth: conf.auth })  } }),
+                  unprotectedSchema, [], R
+                )).data[0] || null;
+            authTried = true;
+        }
+        return _auth || {};
       }
     }
 
@@ -314,10 +377,10 @@ AppPrototype = {
       , query: async function (qTable, qVars) { // FIXME: this is double in format
           let [qt,f] = breakOn(qTable, '.');
           let [t,as] = breakOn(qt, '@');
-          let sqlRes = await me.runSelect(t, as, qVars, R.meta, sch, me.filt, arg, cancelCall);
+          let sqlRes = await me.runSelect(dbh, t, as, qVars, R.meta, sch, me.filt, arg);
           return f ? (await sqlRes.format(f)).text() : sqlRes;
       }
-      , post: (qTable, getVars, input) => me.runPost(qTable, getVars, arg, R.meta, sch, input, undefined, {}, cancelCall)
+      , post: (qTable, getVars, input) => me.runPost(dbh, qTable, getVars, arg, R.meta, sch, input)
     }
     for (let e = 0; e < this.events.onWebRequest.length; e++) {
       let fn = this.events.onWebRequest[e];
@@ -331,22 +394,33 @@ AppPrototype = {
     R.table  = arg.req.table  || R.table;
     R.format = arg.req.format || R.format;
 
-    if (R.req.isPost && typeof post === 'string') {
-      post = await inputRows(this.prsDirs, R.format, post, this.scriptContext( R.format, R.table, R.as, R.vars, R.req, R.meta, sch, cancelCall))
-    }
-
-    let fmtResult = {}, sqlResult;
+    let fmtResult = {}, sqlResult, httpResponse;
     try {
-        sqlResult = R.req.isPost
-           ? await this.runPost  (R.table, R.vars, R.req, R.meta, sch, post, R, R.files, cancelCall)
-           : await this.runSelect(R.table, R.as, R.vars, R.meta, sch, this.filt, {...R.req, ...{ cookie: cookies} }, cancelCall );
+        if (R.req.isPost) {
+          let done = false;
+          let execute = async (irows) => {
+            done = true;
+            if (!Array.isArray(irows)) throw "Input rows must be array of objects";
+            irows.forEach(i => { if (typeof i !== 'object' || !i) throw "Input rows must be array of objects"; } );
+            sqlResult = await this.runPost(dbh, R.table, R.vars, R.req, R.meta, sch, irows, R, R.files)
+            return sqlResult;
+          }
+          if (typeof post === 'string') {
+            post = await inputRows(this.prsDirs, R.format, post, Object.assign(this.scriptContext(dbh, R.format, R.table, R.as, R.vars, R.req, R.meta, sch), { execute }));
+          }
+          if (!done) sqlResult = await execute(post);
+        }
+        else {
+          sqlResult = await this.runSelect(dbh, R.table, R.as, R.vars, R.meta, sch, this.filt, {...R.req, ...{ cookie: cookies} } );
+        }
         fmtResult = await sqlResult.format(R.format);
         // before it was: , R.table, Object.assign({}, R.req.vars, R.vars), Object.assign({}, {...R.req, ...{ cookie: req.cookies}}, { vars: R.vars}), R.meta, await this.schema() );
     } catch (someErr) {
-      if ((someErr || {}).cancelCall) {
-        throw someErr;
-      } else if (someErr instanceof NeedAuth) {
+      if (dbh.rollback) dbh.rollback();
+      if (someErr instanceof NeedAuth) {
         fmtResult.unAuthorized = true;
+      } else if (someErr.status && someErr.out) {
+        fmtResult = someErr;
       } else {
         this.evError(someErr);
         fmtResult.error = someErr;
@@ -354,21 +428,28 @@ AppPrototype = {
     }
 
     if (fmtResult.unAuthorized) switch(this.auth.type) {
-      case 'basic':    return { status: 401, headers: [ { key: 'WWW-Authenticate', value: 'Basic realm="' + this.auth.realm + '"' } ], body: "Unauthorized" }; break;
-      case 'location': return { status: 307, headers: [ { key: 'Location', value: this.auth.location } ], body: '' }; break;
+      case 'basic':    httpResponse = { status: 401, headers: [ { key: 'WWW-Authenticate', value: 'Basic realm="' + this.auth.realm + '"' } ], body: "Unauthorized" }; break;
+      case 'text':     httpResponse = { status: 401, body: this.auth.text}; break;
+      case 'location': httpResponse = { status: 307, headers: [ { key: 'Location', value: this.auth.location } ], body: '' }; break;
       case 'content': {
         let [t,f] = breakOn(this.auth.content, '.'); // TODO: move it to setConf or somewhere
-        if (!f) throw new Exception(106, new Error(), { auth: conf.auth });
+        if (!f) {
+          if (dbh.finalCommit) dbh.finalCommit();
+          throw new Exception(106, new Error(), { auth: conf.auth });
+        }
         let m  = Object.assign({}, R.meta.req, { isMain: false, vars: Object.assign({}, R.vars, this.auth.contentVars||{}) });
         try {
-          sqlResult = await this.runSelect(t, null,
+          sqlResult = await this.runSelect(dbh, t, null,
               Object.assign({}, R.vars, this.auth.contentVars || {}),
               Object.assign({}, R.meta, { auth: async () => null }),
               sch, [], // remove filters in this context
-              {...R.req, ...{ cookie: cookies } }, cancelCall);
+              {...R.req, ...{ cookie: cookies } });
           fmtResult = await sqlResult.format(f);
         } catch (someE) {
-          if (someE instanceof NeedAuth) { throw new Exception(105, new Error(), { auth: conf.auth }); }
+          if (someE instanceof NeedAuth) {
+            if (dbh.finalCommit) dbh.finalCommit();
+            throw new Exception(105, new Error(), { auth: conf.auth });
+          }
           this.evError(someE);
           fmtResult = { error: someE };
         }
@@ -376,17 +457,19 @@ AppPrototype = {
     }
 
     if (fmtResult.unAuthorized) {
-      return { status: 500, headers: [ { key: 'content-type', value: 'text' } ], body: 'Unauthorized' }; // res.status(500).type('text').send('Unauthorized');
+      httpResponse = { status: 401, headers: [ { key: 'content-type', value: 'text' } ], body: 'Unauthorized' };
     } else if (fmtResult.error) {
       throw fmtResult.error;
     } else {
-      return { status: fmtResult.status || 200
-        , headers: fmtResult.headers.concat(fmtResult.contentType ? [{ key: 'content-type', value: fmtResult.contentType}] : [])
+      httpResponse = { status: fmtResult.status || 200
+        , headers: (fmtResult.headers||[]).concat(fmtResult.contentType ? [{ key: 'content-type', value: fmtResult.contentType }] : [])
         , body: !R.pipe
           ? fmtResult.out 
-          : await (this.pipes[R.pipe])(fmtResult.out, t => fmtResult.headers.concat([{key: 'content-type', value : t }]),Object.assign({}, {...R.req, ...{ cookie: cookies}}, { vars: R.vars }))
+          : await (this.pipes[R.pipe])(fmtResult.out, t => fmtResult.headers.concat([{key: 'content-type', value : t }]), Object.assign({}, {...R.req, ...{ cookie: cookies}}, { vars: R.vars }))
       }
     }
+    if (dbh.finalCommit) dbh.finalCommit();
+    return httpResponse;
   },
 
   expressRequest: async function (req, res, next) {
@@ -405,7 +488,10 @@ AppPrototype = {
       (([u,p]) => { if (u) { user = u; pass = p; } })( breakOn( btoa( ((req.get('Authorization') || '').match(/^Basic (.*)/) || [])[1] || ''), ':' ) );
 
     if (req.method === 'POST') {
-      if ((req.headers['content-type']||'').toLowerCase().indexOf('multipart/form-data;') === 0) {
+      const inputType = (req.headers['content-type']||'').toLowerCase();
+      if (inputType.indexOf('multipart/form-data;') === 0 ||
+          inputType.indexOf('application/x-www-form-urlencoded;') === 0)
+      {
         if (!req.body) {
           console.log([ // TODO: this is not console.log
             'Use express-form-data like this: '
@@ -427,22 +513,15 @@ AppPrototype = {
       }
     }
 
-    let cancelCall = new Promise((_, c) => req.on('close', () => c({cancelCall: true})));
-    let x;
+    let x ;
     try {
-      x = await Promise.race([ cancelCall, this.request(req.path.split('/').pop(), vars, { url: req.originalUrl }, req.cookies, post, files, user, pass, cancelCall) ]);
+      x = await this.request(req.path.split('/').pop(), vars, { url: req.originalUrl }, req.cookies, post, files, user, pass);
     } catch (e) {
-      if ((e||{}).cancelCall) {
-        res.end();
-        next();
-        return;
-      } else {
-        console.error(e.isWrapper ? e.err : e);
-        res.write(e.toString());
-        res.end();
-        next();
-        return;
-      }
+      console.error(e.isWrapper ? e.err : e);
+      res.write(e.toString());
+      res.end();
+      next();
+      return;
     }
 
     res.status(x.status);
@@ -459,13 +538,13 @@ AppPrototype = {
   },
 
    // yeah, schema is in 'this' but on auth there is modified schema used 
-  runSelect: async function (table, as, vars, meta, sch, filt = [], dreq = {opts:{}}, cancelCall) { // FIXME: when is dreq missing?
+  runSelect: async function (dbh, table, as, vars, meta, sch, filt = [], dreq = {opts:{}}) { // FIXME: when is dreq missing?
     if (!meta) meta = this.meta;
 
     if (table === '_single') return await this.lite.query('SELECT NULL'); // TODO: run on main database
     if (table === '_empty' ) {
       let r;
-      r = Object.assign({}, this.emptyResult, { format: (fmt, extraVars) => this.format(r, fmt, table, as, Object.assign({}, vars, extraVars), dreq, meta, sch, cancelCall) });
+      r = Object.assign({}, this.emptyResult, { format: (fmt, extraVars) => this.format(dbh, r, fmt, table, as, Object.assign({}, vars, extraVars), dreq, meta, sch) });
       return r;
     }
 
@@ -480,7 +559,7 @@ AppPrototype = {
     }
     if (table === '_schema') await this.schema(); // just to initialize table if not done already
 
-    let cn = table !== '_schema' ? this.conn    : this.lite;
+    let cn = table !== '_schema' ? dbh          : this.lite;
     let tp = table !== '_schema' ? this.sqlType : SqlLt;
     let sc = table !== '_schema' ? sch          : (await this.lite.schema()).map(x => Object.assign(x, {read: true}));
 
@@ -492,19 +571,19 @@ AppPrototype = {
 
     let rsql = Q.sqlSnippet(tp);
     this.evSql({sql: rsql});
-    let res = await cn.query( rsql, [], cancelCall ); 
+    let res = await cn.query( rsql ); 
     if ((dreq.opts||{}).schemaOnly) res.data = []; // with SQLite it fetches one row to know datatypes
-    res.format = (fmt, extraVars = {}) => this.format(res, fmt, table, as, Object.assign({}, vars, extraVars), dreq, meta, sch, cancelCall);
+    res.format = (fmt, extraVars = {}) => this.format(cn, res, fmt, table, as, Object.assign({}, vars, extraVars), dreq, meta, sch);
     res.explainQuery = filled => (filled ? Q : S).describe();
     res.rowsTotal = async () => {
       if ((dreq.opts||{}).schemaOnly) return 0;
-      let csql = Q.count().sqlSnippet(tp);
+      let csql = 'SELECT count(*) FROM (' + Q.count().sqlSnippet(tp) + ') AS x' ; // this is hack hack hack
       this.evSql({sql: csql});
-      return parseInt(((await cn.query(csql, [], cancelCall)).data[0] || { count: 0 }).count, 10);
+      return parseInt(((await cn.query(csql)).data[0] || { count: 0 }).count, 10);
     }
     return res;
   },
-  runPost: async function (table, initVars, req, meta, sch, irows, dreq, files = {}, cancelCall) {
+  runPost: async function (dbh, table, initVars, req, meta, sch, irows, dreq, files = {}) {
     let me = this, results = [], affected = [], rules;
 
     let as, alias = this.alias.find(a => a.name === table);
@@ -522,7 +601,7 @@ AppPrototype = {
     let arg = Object.assign({}, req,
     { tableAs: as
     , vars: vars
-    , post: Object.keys(files).length === 0 ? irows : irows.map(r => Object.assign({}, r, Object.map(files, f => f.path)))
+    , post: Object.keys(files).length === 0 ? irows : irows.map(r => Object.assign({}, r, Object.map(files, f => f.path.split('/').pop())))
     });
     this.events.onPost.reduce((ev, fn) => fn(ev), arg);
     irows = arg.post; // f.path should be updaded file name in browser
@@ -541,7 +620,7 @@ AppPrototype = {
        }
     }
 
-    let db = await this.conn.transaction( cancelCall );
+    let db = await dbh.transaction();
 
     // generate list of functions and execute them later in sync
     let jobLs = rowQ.map((Q,i) => async () => { // do queries and get returning rows
@@ -582,7 +661,7 @@ AppPrototype = {
           move(files[field].path, toPath, () => {
             let evFn = me.events.onAfterUpload || [];
             let arg = Object.assign({}, dreq, { path: toPath });
-            let callNr = 0, callIt = () => { if (callNr === evFn.length) ok(); else evFn(() => { callNr++; callIt() }, arg); }
+            let callNr = 0, callIt = () => { if (callNr === evFn.length) ok(); else evFn[callNr](() => { callNr++; callIt() }, arg); }
             callIt();
           })
         })
@@ -598,10 +677,10 @@ AppPrototype = {
       r  = results.length
       ? Object.assign({}, results[0], { data: results.reduce((R,r) => R.concat(r.data), []) })
       : this.emptyResult,
-      { format: (fmt, extraVars) => this.format(r, fmt, table, as, Object.assign({}, vars, extraVars), dreq, meta, sch, cancelCall) });
+      { format: (fmt, extraVars) => this.format(dbh, r, fmt, table, as, Object.assign({}, vars, extraVars), dreq, meta, sch) });
   },
 
-  scriptContext: function (format, table, tableAs, vars, req, meta, sch, cancelCall) {
+  scriptContext: function (dbh, format, table, tableAs, vars, req, meta, sch) {
     const me = this;
     let evArg = Object.assign({}, req,
         { req: Object.assign({}, {table, tableAs, format, vars}, req)
@@ -611,10 +690,10 @@ AppPrototype = {
         , query: async function (qTable, qVars) {
             let [qt,fmt] = breakOn(qTable, '.');
             let [t,as] = breakOn(qt, '@');
-            let sqlRes = await me.runSelect(t, as, qVars, meta, sch, me.filt, evArg, cancelCall);
+            let sqlRes = await me.runSelect(dbh, t, as, qVars, meta, sch, me.filt, evArg);
             return fmt ? (await sqlRes.format(fmt)).text() : sqlRes;
         }
-        , post: (qTable, getVars, input) => me.runPost(qTable, getVars, evArg, meta, sch, input, undefined, {}, cancelCall)
+        , post: (qTable, getVars, input) => me.runPost(dbh, qTable, getVars, evArg, meta, sch, input)
         , opts: o => req.opts[o] || null
         , parseQuery: async function (expr, table, vars) {
             let alias = me.alias.find(a => a.name === table);
@@ -636,7 +715,7 @@ AppPrototype = {
     , Object.map(this.export, v => typeof v !== 'function' ? v : function () { return v.apply(null, [evArg].concat(Array.from(arguments))); } ));
   },
 
-  format: async function (queryResult, format, table, tableAs, vars, req, meta, sch, cancelCall) {
+  format: async function (dbh, queryResult, format, table, tableAs, vars, req, meta, sch) {
 
     let F = await this.findTemplate(format);
     let me = this, result = {
@@ -644,7 +723,6 @@ AppPrototype = {
       headers: [],
       text: () => {
         if (result.error) {
-          if ((result.error || {}).cancelCall) throw result.error;
           me.evError(result.error);
           throw new Exception(503, result.error, { format: format, vars: vars, table: table });
         } else return result.out
@@ -652,13 +730,13 @@ AppPrototype = {
     }; // this is returned
 
     return new Promise((ok, bad) => {
-      F.script.runInNewContext(Object.assign({}, this.scriptContext(format, table, tableAs, vars, req, meta, sch, cancelCall), F.ctx
+      F.script.runInNewContext(Object.assign({}, this.scriptContext(dbh, format, table, tableAs, vars, req, meta, sch), F.ctx
         , { result: Object.assign({}, queryResult, { format: async (f,a) => (await queryResult.format(f,a)).text() }) // here we want just output text, error are thrown
         ,   contentType: (t,c) => result.contentType = t
         ,   httpStatus : (n  ) => result.status = n
         ,   header     : (k,v) => result.headers.push({ key: k, value: v})
         ,   __success__: ok
-        ,   __failure__: e => { if ( !(e||{}).cancelCall) console.error(e); result.error = e.toString(); bad(e); }
+        ,   __failure__: e => { console.error(e); result.error = e.toString(); bad(e); }
         ,   print:   x => { if (x !== undefined && x !== null) result.out += Buffer.isBuffer(x) ? x.toString() : x; }
         ,   printLn: x => { result.out += Buffer.isBuffer(x) ? x.toString() : x; }
         }));
@@ -674,7 +752,7 @@ AppPrototype = {
       newTable: { value: async function (name, rows) {
         let names = [];
         rows.forEach(r => Object.keys(r).forEach(n => { if (!names.includes(n)) names.push(n) }));
-        let db = await a.conn.transaction( Promise.race([]) );
+        let db = await a.conn.transaction();
         await db.exec('CREATE TABLE ' + name + ' (' + names.join(', ') + ')'); // TODO: escaping and sutff
         let ins = 'INSERT INTO ' + name + '(';
         for (let r = 0; r < rows.length; r++)
@@ -688,8 +766,8 @@ AppPrototype = {
         let [table, fmt] = breakOn(tf, '.');
         let [t, as] = breakOn(table, '@');
         const sch = await a.schema();
-        let qRes = await a.runSelect(t, as, vars, a.meta, sch, a.filt, {}, Promise.race([]) ); // TODO: cancelable stuff
-        return !fmt ? qRes : (await a.format(qRes, fmt, table, as, vars, { isMain: false, isPost: false, vars: vars, url: tf}, meta, sch, Promise.race([]))).text();
+        let qRes = await a.runSelect(a.conn, t, as, vars, a.meta, sch, a.filt, {});
+        return !fmt ? qRes : (await a.format(a.conn, qRes, fmt, table, as, vars, { isMain: false, isPost: false, vars: vars, url: tf}, meta, sch )).text();
       } }
     })
   },
@@ -881,8 +959,8 @@ AppPrototype = {
       let lt = await this.lite.conn;
       await lt.exec('BEGIN');
       await lt.exec('DROP TABLE IF EXISTS _schema');
-      await lt.exec('CREATE TABLE _schema (name varchar, tablename varchar, rawtype varchar, gentype varchar, comment varchar, read boolean, write boolean, protect boolean)');
-      let schIns = await lt.prepare('INSERT INTO _schema VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+      await lt.exec('CREATE TABLE _schema (name varchar, tablename varchar, rawtype varchar, gentype varchar, comment varchar, read boolean, write boolean, protect boolean, "notnull" boolean)');
+      let schIns = await lt.prepare('INSERT INTO _schema VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
 
       await lt.exec("DROP TABLE IF EXISTS _meta");
       await lt.exec("CREATE TABLE _meta (tablename varchar, field varchar, key varchar, value varchar, type varchar)");
@@ -890,8 +968,8 @@ AppPrototype = {
 
       for (let i = 0; i < sch.length; i++) {
         let r, item = sch[i];
-        if ('table' === item._) r = [ item.name, item.name, 'table', 'table',  item.comment, item.read, item.write, item.prot ];
-        if ('field' === item._) r = [ item.name, item.table, item.type, item.genType, item.comment, item.read, item.write, item.prot ]; 
+        if ('table' === item._) r = [ item.name, item.name, 'table', 'table',  item.comment, item.read, item.write, item.prot, false ];
+        if ('field' === item._) r = [ item.name, item.table, item.type, item.genType, item.comment, item.read, item.write, item.prot, item.notnull || false ]; 
         // if ('field' === item._) r = []; 
         await schIns.run(r);
       }
@@ -920,18 +998,11 @@ async function inputRows(dirs, fmt, body, context = {}) {
     { input: body
     , console: console
     , result: r => irows = r
-    , __success__: ok
-    , __failure__: e => { /* console.error(e); */ bad(e); }
+    , abort: (httpStatus, body, contentType) => bad({status: httpStatus || 500, contentType: contentType || 'text/plain', out: body })
+    , __success__: () => ok(irows)
+    , __failure__: e => { console.error(e); throw e; bad(e); }
     }))
-  ).then(() => {
-      if (!Array.isArray(irows)) throw "Input rows must be array of objects";
-      irows.forEach(i => { if (typeof i !== 'object' || !i) throw "Input rows must be array of objects"; } );
-      return irows; 
-  }).catch(e => {
-    throw e;
-    // console.error(e);
-    // this.evError(e);
-  });
+  );
 }
 
 
